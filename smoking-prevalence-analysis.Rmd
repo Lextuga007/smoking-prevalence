@@ -1,0 +1,778 @@
+---
+title: "Smoking Prevalence"
+author: "Zoë Turner"
+date: "21/07/2021"
+output: html_document
+---
+
+# Reduced script for Professional Development evidence
+
+All organisational identifiable information is removed.
+
+This will knit using dummy data created in the file `test_data.R` which has been compiled with a combination of random numbers/dates and some proportions based on the actual data (over several years combined data). 
+
+```{r setup, include=FALSE}
+library(knitr)
+library(tidyverse)
+library(eeptools)
+library(scales)
+library(httr) 
+library(readxl) 
+library(ggtext)
+library(ggplot2)
+library(lubridate)
+library(anytime)
+library(nottshcMethods) # For chart theme and is not on CRAN - see below
+
+# install.packages("remotes")
+# remotes::install_github("CDU-data-science-team/nottshcMethods")
+
+# set default options
+opts_chunk$set(echo = FALSE,
+               fig.width = 7.252,
+               fig.height = 4,
+               dpi = 300,
+               dev.args = list(type = "cairo"),
+               eval = TRUE,
+               warning = FALSE,
+               message = FALSE,
+               error = FALSE)
+
+source("test_data.R")
+
+```
+
+
+```{r load-ons-data}
+# The data on smoking status and referrals are loaded from a SQL server and uses an internal R package for getting and tidying data: loading-data.Rmd
+
+# The following code is for ONS England Public Smoking prevalence figures
+
+tmp <- tempfile(fileext = ".xls")
+url <- GET(url = "https://www.ons.gov.uk/file?uri=%2fpeoplepopulationandcommunity%2fhealthandsocialcare%2fdrugusealcoholandsmoking%2fdatasets%2fadultsmokinghabitsingreatbritain%2f2019/adultsmokinghabitsingreatbritain2019final.xls",
+    write_disk(tmp))
+
+# tidy data ---------------------------
+
+# used {datapasta} to copy from the excel spreadsheet
+
+cnames_age <- c("16-24",
+  "25-34",
+  "35-49",
+  "50-59",
+  "60 and over",
+  "All aged 16 and over")
+
+cnames_gender <- c(
+  "Men",
+  "Women",
+  "All persons")
+
+ # remove the hyphen as this necessitates the use of back ticks in variable names
+
+cnames_clean <- str_remove(cnames_age, "-")
+
+ # remove spaces in the age bands like '60 and over'
+
+cnames_clean <- str_replace_all(cnames_clean, fixed(" "), "")
+
+#### Code to tidy up the spreadsheet but retain the wide form, merges the two headers of sex and age bands together. Keeping the two apart will mean duplication as there are multiple columns for each name (All persons, Women or 16-24, 16-24 instead of All person 16-24, Women 16-24).
+
+clean_data <- read_xls(tmp, sheet = 4, skip = 5) %>% 
+  janitor::clean_names() %>% 
+  janitor::remove_empty(c("rows", "cols")) %>% 
+  pivot_longer(-all_persons_aged_16_and_over,
+               values_to = "values",
+               names_to = "names") %>% 
+  fill(values) %>% 
+  mutate(all_persons_aged_16_and_over = case_when(is.na(all_persons_aged_16_and_over) & values %in% cnames_age ~ "cname_age",
+                                                  is.na(all_persons_aged_16_and_over) & values %in% cnames_gender ~ "cname_gender",
+                                                  TRUE ~ all_persons_aged_16_and_over)) %>%   
+  filter(!str_detect(all_persons_aged_16_and_over, tolower("weight")))
+
+#### Take the top two rows to make new column names
+
+cnames <- clean_data %>% 
+  filter(all_persons_aged_16_and_over == "cname_gender") %>% 
+  cbind(clean_data %>% 
+          filter(all_persons_aged_16_and_over == "cname_age") %>% 
+          rename(age_values = values,
+                 age_names = names)) %>% 
+  select(names,
+         values, 
+         age_values) %>% 
+  unite(values, values:age_values, sep = " ") %>% 
+  mutate(all_persons_aged_16_and_over = "header",
+         values = case_when(str_detect(values, "All persons") == TRUE ~ str_replace(values, "All persons", "Allpersons"), # Remove space for later use of separate() which uses space to determine first part of string
+                         TRUE ~ values))
+
+##### Put the column names and data back into one table
+one_colname <- clean_data %>% 
+  filter(all_persons_aged_16_and_over != "cname_gender",
+         all_persons_aged_16_and_over != "cname_age") %>% 
+  union(cnames) %>%
+  pivot_wider(names_from = names,
+              values_from = values
+  ) %>% 
+  janitor::row_to_names(row_number = nrow(.), remove_rows_above = FALSE) %>% 
+  filter(str_length(header) <= 8,
+         header != "Notes") %>% 
+  mutate(header = substring(header, 1, 4),
+         across(where(is.character), as.numeric),
+         across(where(is.numeric), round, 1))
+
+```
+
+
+# Counts and percentages by year
+
+These counts are for where smoking status is "Current Smoker" and the denominator is for the distinct patients by year. Note that for some patients they are listed as both "Current Smoker" and "Ex Smoker" or any other combination of statuses. These means that the person could be counted twice but in separate categories.
+
+All counts are for distinct patients based on their patient_id so even if there are multiple smoking statuses (that are the same) or referrals/admissions in a year, the count will only be once.
+
+```{r ons-data-preparation}
+
+ons_df <- function(gender_group, age_group){
+  
+  df <- one_colname %>% 
+    mutate(year = ymd(paste0(header, "-01", "-01"))) %>% 
+    pivot_longer(cols = c(-"header", -"year"),
+                 names_to = "age_bands",
+                 values_to = "pop_values") %>% 
+    mutate(pop_values = round(pop_values, 0)) %>%
+    separate(age_bands, c("gender", "age"), extra = "merge") %>%
+    # remove hyphen and spaces to match cnames_clean
+    mutate(age = str_remove(age, "-"),
+           age = str_replace_all(age, fixed(" "), "")) %>% 
+    filter(gender %in% gender_group,
+           age == age_group)
+  
+  return(df)
+
+}
+
+ons_clean <- ons_df(c("Allpersons"), "Allaged16andover")
+ons_men <- ons_df(c("Men"), "Allaged16andover")
+ons_women <- ons_df(c("Women"), "Allaged16andover")
+
+```
+
+```{r trust-data-preparation}
+
+count_status <- function(data, min_age, vars, gender_type, ons_data){
+  
+  df <- data %>% 
+    filter(age_at_year >= min_age,
+           !is.na(smoking_status),
+           !smoking_status %in% c("Not Known/Pending Assessment",
+                               "Patient Refused to Disclose"),
+           gender %in% c(gender_type)) %>% 
+    group_by(!!! syms(vars)) %>% 
+    mutate(n_total_denom = n_distinct(patient_id),
+         gender = case_when(gender == "M" ~ "Men",
+                            gender == "F" ~ "Women",
+                            TRUE ~ gender)) %>% 
+    ungroup() %>% 
+    group_by(!!! syms(vars),
+             smoking_status,
+             n_total_denom) %>% 
+    summarise(n_status_num = n_distinct(patient_id)) %>% 
+    mutate(perc_total = round(n_status_num / n_total_denom, 2) * 100) %>% 
+    filter(year > '2006-01-01') %>% 
+    filter(smoking_status == "Current Smoker") %>% 
+    left_join(ons_data) %>% 
+    mutate(header = case_when(is.na(header) ~ as.numeric(year(year)),
+                              TRUE ~ header)) 
+  return(df)
+}
+
+prevalence <- count_status(combined_test, 16, "year", c("M", "F"), ons_clean) 
+prevalence_men <- count_status(combined_test, 16, c("year", "gender"), "M", ons_men)  
+prevalence_women <- count_status(combined_test, 16, c("year", "gender"), "F", ons_women)  
+
+prevalence_ons_agebands <- count_status(combined_test, 16, c("year", "age_bands"), c("M", "F"), ons_clean)
+prevalence_under16 <- count_status(combined_test, 0, c("year", "age_bands"), c("M", "F"), ons_clean)
+
+```
+
+# Prevalence
+
+```{r create-prevalence-dfs}
+
+ons_prevalence <- ons_clean %>%
+  full_join(prevalence)
+
+ons_prevalence_males <- ons_men %>%
+  full_join(prevalence_men)
+
+ons_prevalence_females <- ons_women %>%
+  full_join(prevalence_women)
+
+
+# loop to create combined prevalence (Trust and ONS) by age bands
+
+for(i in cnames_clean){ 
+  
+  # use function to filter ONS data by age band using the age band names with no spaces or hyphens
+  
+  df <- ons_df(c("Allpersons"), i) %>% 
+  full_join(prevalence_ons_agebands %>%
+              filter(age_bands == i) %>%
+              select(-age,
+                     -pop_values,
+                     -gender) %>% 
+              rename(age = age_bands)
+              )
+  
+  # create a data frame to hold results
+  assign(paste('ons_prevalence_', i, sep = ''), df)
+}
+
+```
+
+As smoking is legally only for those age 16 and older, when comparing with ONS prevalence, the Trust data filters for patients over 16 in the year the referral was open/the patient was on the ward.
+
+The previous time this analysis was conducted the Trust's prevalence was % but this has been corrected with the improved methodology and is now `r ons_prevalence %>% filter(header == 2019) %>% pull(perc_total) `%. 
+
+```{r matching-trust-to-ons}
+
+  # Find the maximum local prevalence which matches the ons public prevalence with a range of +-2
+match_function <- function(data){
+  
+  # get latest Trust percentage figure
+  a <- data %>% 
+    filter(!is.na(perc_total)) %>% 
+    filter(header == max(.$header, na.rm = TRUE))
+  
+  # find exact matches to the ONS percentages
+   trust_ons <- data %>% 
+    filter(pop_values == a$perc_total) %>% 
+    filter(pop_values == min(pop_values)) %>% 
+    filter(header == max(header))
+  
+  # find the matching (+/- 1) to the ONS percentages
+  if(nrow(trust_ons) == 0){
+    
+    trust_ons <- data %>% 
+    filter(between(pop_values, a$perc_total - 1, a$perc_total + 1)) %>% 
+    filter(pop_values == min(pop_values)) %>% 
+    filter(header == max(header))
+    
+  }
+
+  # because the ons_prevalence_2534 doesn't match on 1 difference this is an error handler
+  if(nrow(trust_ons) == 0){
+    
+    trust_ons <- data %>% 
+    filter(between(pop_values, a$perc_total - 4, a$perc_total + 4)) %>% 
+    filter(pop_values == min(pop_values)) %>% 
+    filter(header == max(header))
+  }
+  
+  return(trust_ons)
+}
+```
+
+```{r chart-function}
+
+chart_function <- function(data, 
+                           period = c("trust", "public"),
+                           position_ons_earliest,
+                           position_trust_earliest,
+                           position_ons_latest,
+                           position_trust_latest)
+  {
+  
+  period <- match.arg(period)
+  
+  # generic setting such as colours and finding the latest ONS value which is used to anchor the text percentage labels
+  group_col <- c("Organisation" = "#005EB8", "National" = "#B5D63D")
+
+  latest_ons <- prevalence %>% 
+    filter(!is.na(pop_values)) 
+
+  # function used to find the maximum local prevalence which matches the ons public prevalence with a range of +-2
+  trust_ons <- match_function(data)
+  
+    
+  # Plots ----------------------------------
+
+  # Base plot used in either the shorter Trust timeline or longer ONS
+  
+  plot <- ggplot(data, aes(x = year)) +
+    geom_line(aes(y = perc_total, colour = "Organisation"), size = 1) +
+    geom_line(aes(y = pop_values, colour = "National"), size = 1) +
+    scale_color_manual(values = group_col) +
+    labs(subtitle = "Organisation",
+         caption = "Source: Organisation/ONS",
+         x = NULL,
+         y = NULL, 
+         colour = NULL) +
+    ylim(0, 60) +
+    nottshcMethods::ds_theme() +
+    theme(axis.title.y = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+    # Trust earliest date % figure
+    geom_richtext(aes(x = min(prevalence$year), 
+                      y = data %>% 
+                        filter(!is.na(perc_total)) %>% 
+                        filter(header == min(.$header, na.rm = TRUE)) %>% 
+                        pull(perc_total) - position_trust_earliest, 
+                      label = paste0(data %>% 
+                                       filter(!is.na(perc_total)) %>% 
+                                       filter(header == min(.$header, na.rm = TRUE)) %>% 
+                                       pull(perc_total), "%")),
+                  size = 3, 
+                  lineheight = .9,
+                  fill = NA, 
+                  label.color = NA, 
+                  stat = "unique") +
+    # ONS earliest date % figure
+    geom_richtext(aes(x = min(year), 
+                      y = max(pop_values, na.rm = TRUE) - position_ons_earliest, 
+                      label = paste0(max(pop_values, na.rm = TRUE), "%")),
+                  size = 3, 
+                  lineheight = .9,
+                  fill = NA, 
+                  label.color = NA, 
+                  stat = "unique") +
+    # Trust latest date % figure
+    geom_richtext(aes(x = max(year), 
+                      y = data %>% 
+                        filter(!is.na(perc_total)) %>% 
+                        filter(header == max(.$header, na.rm = TRUE)) %>% 
+                        pull(perc_total) - position_trust_latest, 
+                      label = paste0(data %>% 
+                                       filter(!is.na(perc_total)) %>% 
+                                       filter(header == max(.$header, na.rm = TRUE)) %>% 
+                                       pull(perc_total), "%")),
+                  size = 3, 
+                  lineheight = .9,
+                  fill = NA, 
+                  label.color = NA, 
+                  stat = "unique") +
+    # ONS latest date % figure (uses restricted table created earlier for date)
+    geom_richtext(aes(x = max(latest_ons$year), 
+                      y = data %>% 
+                        filter(!is.na(pop_values)) %>% 
+                        filter(header == max(.$header, na.rm = TRUE)) %>% 
+                        pull(pop_values) - position_ons_latest, 
+                      label = paste0(data %>% 
+                                       filter(!is.na(pop_values)) %>% 
+                                       filter(header == max(.$header, na.rm = TRUE)) %>% 
+                                       pull(pop_values), "%")),
+                  size = 3, 
+                  lineheight = .9,
+                  fill = NA, 
+                  label.color = NA, 
+                  stat = "unique")
+  
+ # Trust data is shorter in period  
+  if (period == "trust") {
+    
+    plot <- plot + scale_x_continuous(breaks = c(min(data$year), 
+                                                 max(data$year)),
+                                      labels = c(min(data$header), 
+                                                 max(data$header))) 
+  }
+  
+  # ONS data is longer in period
+  
+  if(period == "public"){
+    
+    plot <- plot + 
+      # additional date required for smoking ban
+      scale_x_continuous(breaks = c(min(ons_prevalence$year), 
+                                    min(prevalence$year),
+                                    max(ons_prevalence$year)),
+                         labels = c(min(ons_prevalence$header), 
+                                    min(prevalence$header),
+                                    max(ons_prevalence$header))) +
+      # Add dotted grey line to link Trust to equivalent ONS %
+      # x and y from ONS and xend and yend from Trust data
+      geom_segment(aes(x = trust_ons$year, 
+                       y = trust_ons$pop_values, 
+                       xend = max(prevalence$year, na.rm = TRUE), 
+                       yend = min(perc_total, na.rm = TRUE), 
+                       colour = "grey"),
+                   linetype = 2) 
+  }
+  
+  return(plot)
+}
+
+
+```
+
+```{r plot-prevalence-trust}
+
+# uses the shorter timeline for Trust rather than ONS
+
+chart_function(prevalence, period = "trust", 
+               position_ons_earliest = 2,
+               position_trust_earliest = 3, 
+               position_ons_latest = 2,
+               position_trust_latest = 2) +
+  labs(title = "Smoking prevalence for Mental Health patients")
+```
+
+# ONS prevalence over time
+
+Plotting ONS prevalence data which is available from 1974 along with Trust data, highlighting the point at which the England public smoking ban started.
+
+
+```{r plot-prevlance-ons}
+
+smoking_ban <- ons_clean %>% 
+  filter(header == 2007)
+
+text_x <- ons_clean %>% 
+  filter(header == 1982)
+
+# Find the maximum local prevalence which matches the ons public prevalence with a range of +-2
+trust_ons <- match_function(ons_prevalence)
+
+chart_function(ons_prevalence, period = "public", 
+               position_ons_earliest = 4, 
+               position_trust_earliest = 3, 
+               position_ons_latest = 3,
+               position_trust_latest = 2) +
+  geom_textbox(aes(x = text_x$year,
+                   y = 20,
+                   label = paste("Org smoking prevalence in", ons_prevalence %>% filter(header == max(ons_prevalence$header)) %>% pull(header), "was equivalent to the level of smokers in ", trust_ons %>% pull(header), "nationally (+-1%)."), sep = " "),
+               size = 3, 
+               lineheight = .9,
+               fill = NA, 
+               label.color = NA, 
+               stat = "unique") +
+  labs(title = "Smoking prevalence for Mental Health patients") +
+  # Add arrow to show smoking ban
+  geom_segment(aes(x = smoking_ban$year, 
+                   y = 10, 
+                   xend = smoking_ban$year, 
+                   yend = smoking_ban$pop_values), 
+               colour = 'dark grey', 
+               size = 2,
+               arrow = arrow(length = unit(0.5, "cm"))) +
+  geom_label(aes(x = smoking_ban$year,
+                 y = 1.5),
+             label = "Public smoking ban", 
+             check_overlap = T)
+
+
+```
+
+# Gender
+
+```{r plot-prevalence-males}
+
+# Find the maximum local prevalence which matches the ons public prevalence with a range of +-2
+trust_ons_males <- match_function(ons_prevalence_males)
+
+chart_function(ons_prevalence_males, period = "public",
+               position_ons_earliest = 2, 
+               position_trust_earliest = 2, 
+               position_ons_latest = 3,
+               position_trust_latest = 2) +
+  labs(title = "Smoking prevalence in Mental Health patients (males)") +
+  geom_textbox(aes(x = text_x$year,
+                   y = ons_prevalence_males %>% 
+                     filter(!is.na(perc_total)) %>% 
+                     filter(header == min(.$header, na.rm = TRUE)) %>% 
+                     pull(perc_total) -25,
+                   label = paste("Org male patient smoking prevalence in", ons_prevalence %>% filter(header == max(ons_prevalence$header)) %>% pull(header), "was equivalent to the level of smokers in", trust_ons_males %>% pull(header), "nationally (+-1%)."), sep = " "),
+               size = 3, 
+               lineheight = .9,
+               fill = NA, 
+               label.color = NA, 
+               stat = "unique") 
+
+
+```
+
+```{r plot-prevalence-females}
+
+# Find the maximum local prevalence which matches the ons public prevalence with a range of +-2
+trust_ons_females <- match_function(ons_prevalence_females)
+
+chart_function(ons_prevalence_females, period = "public",
+               position_ons_earliest = 2, 
+               position_trust_earliest = 2, 
+               position_ons_latest = 2,
+               position_trust_latest = 2) +
+  labs(title = "Smoking prevalence in Mental Health patients (females)") +
+  geom_textbox(aes(x = text_x$year,
+                   y = ons_prevalence_males %>% 
+                     filter(!is.na(perc_total)) %>% 
+                     filter(header == min(.$header, na.rm = TRUE)) %>% 
+                     pull(perc_total) -25,
+                   label = paste("Org female patient smoking prevalence in", ons_prevalence %>% filter(header == max(ons_prevalence$header)) %>% pull(header), "was equivalent to the level of smokers in ", trust_ons_females %>% pull(header), " nationally (+-1%)."), sep = " "),
+               size = 3, 
+               lineheight = .9,
+               fill = NA, 
+               label.color = NA, 
+               stat = "unique") 
+
+```
+
+# Age
+
+
+```{r plot-prevalence-agebands}
+for(i in cnames_clean){ 
+  
+  # use function to filter ONS data by age band using the age band names with no spaces or hyphens
+  # join to the Trust data, also filtered by age band
+  
+  df <- ons_df(c("Allpersons"), i) %>% 
+    full_join(prevalence_ons_agebands %>%
+                filter(age_bands == i) %>%
+                select(-age,
+                       -pop_values,
+                       -gender) %>% 
+                rename(age = age_bands))
+  
+  # create a data frame to hold results
+  assign(paste('ons_prevalence_', cnames_clean[i], sep = ''), df)
+}
+
+# plots for age bands ----------------------------------------------
+
+age_bands <- list(ons_prevalence_1624,
+                  ons_prevalence_2534,
+                  ons_prevalence_3549,
+                  ons_prevalence_5059,
+                  ons_prevalence_60andover)
+
+age_bands_names <- c("16-24",
+                      "25-34",
+                      "35-49",
+                      "50-59",
+                      "60 and over")
+
+age_bands_names <- c("<span style = >**16-24 year olds:** The gap between **National** and **Mental Health patients** is ...</span>",
+"<span style = >**25-34 year olds:** **Nationally** this is the age group with the highest smoking prevalence... </span>",
+"<span style = >**35-49 year olds:** ...</span>",
+"<span style = >**50-59 year olds:** The gap between **National** and **Mental Health patients** is ...</span>",
+"<span style = >**Over 60 year old:** The gap between **National** and **Mental Health patients** is the lowest rate across all age groups... </span>")
+```
+
+
+```{r plots}
+walk2(age_bands, age_bands_names, function(x, y) {
+
+   # Find the maximum local prevalence which matches the ons public prevalence with a range of +-2  
+   ons_date_match <- match_function(x)
+  
+   p <- chart_function(x, period = "public",
+                 position_ons_earliest = 2, 
+                 position_trust_earliest = 2, 
+                 position_ons_latest = 2,
+                 position_trust_latest = 2) +
+  geom_textbox(aes(x = text_x$year,
+                   y = 0,
+                   label = y),
+               nudge_y = 15,
+               size = 3, 
+               lineheight = .9,
+               stat = "unique") +
+     # additional date required for ONS match date
+      scale_x_continuous(breaks = c(min(ons_prevalence$year), 
+                                    min(ons_date_match$year),
+                                    max(ons_prevalence$year)),
+                         labels = c(min(ons_prevalence$header), 
+                                    min(ons_date_match$header),
+                                    max(ons_prevalence$header))) +
+     labs(title = paste0("Smoking prevalence in Mental Health patients (", 
+       substring(y, 
+                 str_locate(y, "[0-9]"), 
+                 str_locate(y, ":") - 1), 
+       " age band)")) 
+   
+  print(p)
+})
+```
+
+# Wards
+
+
+```{r wards}
+
+ward_prevalence <- combined_test %>% 
+  filter(!is.na(smoking_status),
+         !smoking_status %in% c("Not Known/Pending Assessment",
+                                "Patient Refused to Disclose")) %>% 
+  group_by(year,
+           service) %>% 
+  mutate(n_total_denom = n_distinct(patient_id)) %>% 
+  ungroup() %>% 
+  group_by(year,
+           smoking_status,
+           service,
+           n_total_denom) %>% 
+  summarise(n_status_num = n_distinct(patient_id)) %>% 
+  mutate(perc_total = round(n_status_num / n_total_denom, 2)) %>%
+  filter(year > '2006-01-01',
+         smoking_status == "Current Smoker",
+         !is.na(service)) %>% 
+    group_by(service) %>% 
+  mutate(label = case_when(year == min(year) ~ service,
+                           TRUE ~ NA_character_),
+         final_value = case_when(year == max(year) ~ perc_total,
+                                 TRUE ~ NaN)) %>% 
+  ungroup()
+  
+  
+  
+```
+
+```{r}
+
+# Smaller percentages overlap on labels so restricting on anything over 10%
+ward_labels <- ward_prevalence %>% 
+  select(final_value) %>% 
+  filter(final_value > .1) %>% 
+  unique()
+
+ggplot(ward_prevalence, aes(x = year, y = perc_total, 
+                            group = service, 
+                            colour = service)) +
+  geom_line() +
+  labs(
+    title = "Smoking prevalence for Mental Health patients",
+    subtitle = "Organisation NHS Foundation Trust",
+    caption = "Source: Org",
+    x = NULL,
+    y = NULL, 
+    colour = NULL) +
+  scale_y_continuous(position = "right",
+                     breaks = c(0, ward_labels$final_value),
+                     labels = scales::percent_format(accuracy = 1)) +
+  nottshcMethods::ds_theme() +
+  theme(legend.position = "none") +
+  ggrepel::geom_label_repel(aes(label = label)) +
+  viridis::scale_color_viridis(discrete = TRUE, option = "turbo") 
+
+```
+
+# Not assessed
+
+
+```{r}
+
+not_assessed_staging <- referrals_test_filled %>% 
+  filter(year > '2006-01-01') %>%  
+  left_join(smoking_test %>% 
+              mutate(year = floor_date(assessment_date, "year")) %>% 
+              filter(year > '2007-01-01')) %>% # only one record for smoking status recorded in 2007
+  mutate(age_at_year = eeptools::age_calc(as.Date(dob),
+                                          as.Date(year),
+                                          units = "years",
+                                          precise = FALSE),
+         age_bands = case_when(age_at_year < 16                     ~ 'under 16',
+                               age_at_year > 15 & age_at_year <  25 ~ '16-24',
+                               age_at_year > 24 & age_at_year <  35 ~ '25-34',
+                               age_at_year > 34 & age_at_year <  50 ~ '35-49',
+                               age_at_year > 49 & age_at_year <  60 ~ '50-59',
+                               age_at_year > 59 ~ '60 and over',
+                               TRUE ~ 'no age'),
+         age_bands = factor(age_bands,
+                            levels = c('under 16',
+                                       '16-24',
+                                       '25-34',
+                                       '35-49',
+                                       '50-59',
+                                       '60 and over')),
+         status = case_when(!is.na(assessment_date) ~ "Assessed",
+                            TRUE ~ "Not assessed"),
+         status = factor(status,
+                         levels = c("Not assessed", "Assessed"))) 
+
+prepare_missing_function <- function(var){
+  
+  data <- not_assessed_staging %>% 
+    select(patient_id,
+           year,
+           status,
+           !!! sym(var)) %>% 
+    group_by(year,
+             status,
+             !!! sym(var)) %>% 
+    summarise(count = n_distinct(patient_id)) %>% 
+    ungroup() %>% 
+    mutate(header = substring(year, 1, 4)) 
+
+  
+  data2 <- data %>% 
+    left_join(data %>% 
+                group_by(!!! sym(var)) %>% 
+                filter(status == "Assessed") %>% 
+                mutate(y_dates = case_when(count == max(count) ~ year,
+                                           TRUE ~ NA_Date_),
+                       y_label = case_when(!is.na(y_dates) ~ substring(year, 1, 4),
+                                           TRUE ~ NA_character_))) %>% 
+    left_join(data %>% 
+                filter(status == "Assessed") %>% 
+                mutate(max_y_dates = case_when(count == max(count) ~ year,
+                                           TRUE ~ NA_Date_),
+                       max_y_label = case_when(!is.na(max_y_dates) ~ substring(year, 1, 4),
+                                           TRUE ~ NA_character_))
+                
+    )
+  
+  return(data2)
+  
+}
+
+
+```
+
+
+```{r}
+
+missing_chart_function <- function(data){
+  
+  data <- prepare_missing_function(data)
+  
+  group_col <- c("Assessed" = "#00203FFF", "Not assessed" = "#ADEFD1FF")
+  
+  plot <- ggplot(data, aes(fill = status, x = year, y = count)) +
+    geom_bar(position = "fill", stat = "identity") +
+    scale_fill_manual(values = group_col) +
+    labs(
+      title = "Smoking assessment breakdown for Mental Health patients",
+      subtitle = paste0("<span style = 'color:#757575;'>Organisation</span>"),
+      caption = "Source: Org",
+      x = NULL,
+      y = NULL, 
+      colour = NULL
+    ) +
+    nottshcMethods::ds_theme() +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_x_date(breaks = c(min(data$year), 
+                            data$max_y_dates,
+                            max(data$year)),
+                 labels = c(min(data$header),
+                            data$max_y_label,
+                            max(data$header)))
+  
+  return(plot)
+  
+  }
+
+```
+
+```{r}
+missing_chart_function("")
+  
+missing_chart_function("age_bands") + 
+  facet_wrap(~age_bands)
+```
+
+```{r}
+missing_chart_function("gender") + 
+  facet_wrap(~gender)
+```
+
+
